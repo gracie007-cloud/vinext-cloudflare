@@ -2566,9 +2566,20 @@ hydrate();
 
                 if (!result.continue) {
                   if (result.redirectUrl) {
-                    res.writeHead(result.redirectStatus ?? 307, {
-                      Location: result.redirectUrl,
-                    });
+                    const redirectHeaders: Record<string, string | string[]> = { Location: result.redirectUrl };
+                    if (result.responseHeaders) {
+                      for (const [key, value] of result.responseHeaders) {
+                        const existing = redirectHeaders[key];
+                        if (existing === undefined) {
+                          redirectHeaders[key] = value;
+                        } else if (Array.isArray(existing)) {
+                          existing.push(value);
+                        } else {
+                          redirectHeaders[key] = [existing, value];
+                        }
+                      }
+                    }
+                    res.writeHead(result.redirectStatus ?? 307, redirectHeaders);
                     res.end();
                     return;
                   }
@@ -2661,7 +2672,11 @@ hydrate();
                   apiRoutes,
                 );
                 if (handled) return;
-                // No API route matched — fall through to 404
+
+                // No API route matched — if app dir exists, let the RSC plugin handle it
+                // (app/api/* route handlers live there). Otherwise hard-404.
+                if (hasAppDir) return next();
+
                 res.statusCode = 404;
                 res.end("404 - API route not found");
                 return;
@@ -2716,7 +2731,10 @@ hydrate();
                 }
               }
 
-              // No fallback matched — render as-is (will hit 404 handler)
+              // No fallback matched - if app dir exists, let the RSC plugin handle it,
+              // otherwise render via the pages SSR handler (will 404 for unknown routes).
+              if (hasAppDir) return next();
+
               await handler(req, res, resolvedUrl, mwStatus);
             } catch (e) {
               next(e);
