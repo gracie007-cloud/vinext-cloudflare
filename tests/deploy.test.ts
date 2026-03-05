@@ -240,8 +240,7 @@ describe("detectProject", () => {
     writeFile(tmpDir, "package.json", JSON.stringify({ name: "My App_v2!" }));
     const info = detectProject(tmpDir);
     // Workers names: lowercase alphanumeric + hyphens
-    expect(info.projectName).toMatch(/^[a-z0-9-]+$/);
-    expect(info.projectName).not.toMatch(/^-|-$/);
+    expect(info.projectName).toBe("my-app-v2");
   });
 
   it("falls back to directory name when no package.json", () => {
@@ -546,6 +545,15 @@ describe("generatePagesRouterWorkerEntry", () => {
     // mergeHeaders should spread extraHeaders first, then overlay response headers.
     expect(content).toContain("{ ...extraHeaders }");
     expect(content).toContain("response.headers.forEach");
+  });
+
+  it("preserves x-middleware-request-* headers for prod request override handling", () => {
+    const content = generatePagesRouterWorkerEntry();
+    // Worker entry must unpack x-middleware-request-* into the actual request
+    expect(content).toContain('const mwReqPrefix = "x-middleware-request-"');
+    expect(content).toContain('key.startsWith(mwReqPrefix)');
+    // Worker entry must also strip remaining x-middleware-* headers (defense-in-depth)
+    expect(content).toContain('key.startsWith("x-middleware-")');
   });
 
   it("handles external rewrites via proxyExternalRequest", () => {

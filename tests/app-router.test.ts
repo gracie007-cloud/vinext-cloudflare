@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { createBuilder, type ViteDevServer } from "vite";
 import path from "node:path";
 import fs from "node:fs";
@@ -86,6 +86,18 @@ describe("App Router integration", () => {
   it("returns 404 for non-existent routes", async () => {
     const res = await fetch(`${baseUrl}/nonexistent`);
     expect(res.status).toBe(404);
+  });
+
+  // Dual-router coexistence: the app-basic fixture has both app/ and pages/
+  // (pages/old-school.tsx activates hasPagesDir). This verifies the Pages Router
+  // still renders its own pages correctly when both routers are active — the
+  // other direction from the fix that stops pages-router middleware from
+  // hard-404ing app/api/* routes that belong to the App Router.
+  it("renders pages-router page when both app/ and pages/ directories exist", async () => {
+    const res = await fetch(`${baseUrl}/old-school`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Old School Pages Directory");
   });
 
   it("returns RSC stream for .rsc requests", async () => {
@@ -586,6 +598,27 @@ describe("App Router integration", () => {
     // The $RX call should include the NEXT_HTTP_ERROR_FALLBACK digest so the
     // NotFoundBoundary can catch it and render not-found.tsx
     expect(html).toMatch(/\$RX\("[^"]*","NEXT_HTTP_ERROR_FALLBACK/);
+  });
+
+  it("async server throw in Suspense falls back to client rendering without dev decode crash (React 19 regression)", async () => {
+    // Regression for issue #50:
+    // React 19 dev-mode Flight decoding can crash in resolveErrorDev() with
+    // "Invalid hook call" / null dispatcher errors while SSR consumes an RSC
+    // stream that includes an error chunk.
+    const res = await fetch(`${baseUrl}/react19-dev-rsc-error`);
+    const html = await res.text();
+
+    expect(res.status).toBe(200);
+    // In React 19 dev mode, this route switches to client rendering when the
+    // async server throw is encountered during Flight streaming. The key
+    // regression check is that decode no longer crashes with a null dispatcher.
+    // Note: "Switched to client rendering" is a React internal message that
+    // may change across React versions.
+    expect(html).toContain("Switched to client rendering");
+    expect(html).toContain("react19-dev-rsc-error");
+    expect(html).toContain('data-testid="react19-dev-rsc-loading"');
+    expect(html).not.toContain("Invalid hook call");
+    expect(html).not.toContain("Cannot read properties of null (reading 'useContext')");
   });
 
   it("renders error boundary wrapper for routes with error.tsx", async () => {
@@ -2010,6 +2043,14 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     expect(code).toContain(":path*");
   });
 
+  it("validates proxy.ts exports in generated middleware dispatch (matching Next.js)", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes, "/tmp/proxy.ts", [], null, "", false);
+    // For proxy.ts files, named proxy export is preferred over default
+    expect(code).toContain("middlewareModule.proxy ?? middlewareModule.default");
+    // Should throw if no valid export found
+    expect(code).toContain('must export a function named');
+  });
+
   it("applies redirects before middleware in the handler", () => {
     const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false, {
       redirects: [{ source: "/old", destination: "/new", permanent: true }],
@@ -2163,7 +2204,7 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     expect(code).toContain("__safeDevHosts");
     // Should call dev origin validation inside _handleRequest
     const callSite = code.indexOf("const __originBlock = __validateDevRequestOrigin(request)");
-    const handleRequestIdx = code.indexOf("async function _handleRequest(request)");
+    const handleRequestIdx = code.indexOf("async function _handleRequest(request, __reqCtx)");
     expect(callSite).toBeGreaterThan(-1);
     expect(handleRequestIdx).toBeGreaterThan(-1);
     // The call should be inside the function body (after the function declaration)
@@ -2177,6 +2218,119 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     expect(code).toContain("staging.example.com");
     expect(code).toContain("*.preview.dev");
     expect(code).toContain("__allowedDevOrigins");
+  });
+
+  describe("rscOnError: non-plain object dev hint", () => {
+    it("includes detection for the 'Only plain objects' RSC serialization error", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      expect(code).toContain(
+        "Only plain objects, and a few built-ins, can be passed to Client Components",
+      );
+    });
+
+    it("guards the dev hint behind a NODE_ENV !== production check", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      // The hint must be suppressed in production builds
+      expect(code).toContain('process.env.NODE_ENV !== "production"');
+    });
+
+    it("includes actionable guidance about module namespace objects in the hint", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      expect(code).toContain("import * as X");
+      expect(code).toContain("[vinext] RSC serialization error");
+    });
+
+    it("includes actionable guidance about class instances in the hint", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      expect(code).toContain("class instance");
+    });
+
+    it("does not affect the digest return path for navigation errors", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      // The existing digest path (redirect/notFound) must still be present
+      expect(code).toContain('"digest" in error');
+      expect(code).toContain("String(error.digest)");
+    });
+
+    // Runtime tests: extract the rscOnError function from the generated code
+    // and evaluate it. This catches syntax errors and logic bugs that the
+    // string-presence tests above would miss (e.g. unterminated strings,
+    // wrong return values, broken control flow).
+    describe("runtime behavior", () => {
+      let rscOnError: (error: unknown) => string | undefined;
+
+      beforeAll(() => {
+        const code = generateRscEntry(
+          "/tmp/test/app",
+          minimalRoutes,
+          null,
+          [],
+          null,
+          "",
+          false,
+        );
+
+        // Extract a top-level function from the generated code by matching
+        // balanced braces (simple regex can't handle nested braces).
+        function extractFunction(src: string, name: string): string {
+          const marker = `function ${name}(`;
+          const start = src.indexOf(marker);
+          if (start === -1) throw new Error(`Could not find ${name} in generated code`);
+          const braceStart = src.indexOf("{", start);
+          let depth = 0;
+          for (let i = braceStart; i < src.length; i++) {
+            if (src[i] === "{") depth++;
+            else if (src[i] === "}") depth--;
+            if (depth === 0) return src.slice(start, i + 1);
+          }
+          throw new Error(`Unbalanced braces in ${name}`);
+        }
+
+        const digestFn = extractFunction(code, "__errorDigest");
+        const onErrorFn = extractFunction(code, "rscOnError");
+
+        const body = `${digestFn}\n${onErrorFn}\nreturn rscOnError;`;
+        const factory = new Function("process", body);
+        rscOnError = factory({ env: { NODE_ENV: "development" } });
+      });
+
+      it("returns the digest string for navigation errors (redirect/notFound)", () => {
+        const error = Object.assign(new Error("NEXT_REDIRECT"), {
+          digest: "NEXT_REDIRECT;push;/dashboard;307",
+        });
+        expect(rscOnError(error)).toBe("NEXT_REDIRECT;push;/dashboard;307");
+      });
+
+      it("logs an actionable hint and returns undefined for RSC serialization errors", () => {
+        const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const error = new Error(
+            "Only plain objects, and a few built-ins, can be passed to Client Components from Server Components. " +
+              "Objects with toJSON methods are not supported. Module namespace objects are not supported.",
+          );
+          const result = rscOnError(error);
+          expect(result).toBeUndefined();
+          expect(spy).toHaveBeenCalledOnce();
+          expect(spy.mock.calls[0]![0]).toContain(
+            "[vinext] RSC serialization error",
+          );
+        } finally {
+          spy.mockRestore();
+        }
+      });
+
+      it("returns undefined for generic errors in dev (no digest, no serialization match)", () => {
+        const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+        try {
+          const result = rscOnError(new Error("something went wrong"));
+          expect(result).toBeUndefined();
+          // Should NOT log the hint for unrelated errors
+          expect(spy).not.toHaveBeenCalled();
+        } finally {
+          spy.mockRestore();
+        }
+      });
+    });
   });
 });
 
@@ -2617,4 +2771,3 @@ describe("App Router external rewrite proxy credential stripping", () => {
     expect(capturedHeaders!["x-custom-safe"]).toBe("keep-me");
   });
 });
-

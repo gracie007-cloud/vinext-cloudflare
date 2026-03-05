@@ -13,6 +13,7 @@ import type { MetadataFileRoute } from "./metadata-routes.js";
 import type { NextRedirect, NextRewrite, NextHeader } from "../config/next-config.js";
 import { generateDevOriginCheckCode } from "./dev-origin-check.js";
 import { generateSafeRegExpCode, generateMiddlewareMatcherCode, generateNormalizePathCode } from "./middleware-codegen.js";
+import { isProxyFile } from "./middleware.js";
 
 /**
  * Resolved config options relevant to App Router request handling.
@@ -244,6 +245,20 @@ function setNavigationContext(ctx) {
 // based on export const revalidate for testing purposes.
 // Production ISR is handled by prod-server.ts and the Cloudflare worker entry.
 
+// Normalize null-prototype objects from matchPattern() into thenable objects
+// that work both as Promises (for Next.js 15+ async params) and as plain
+// objects with synchronous property access (for pre-15 code like params.id).
+//
+// matchPattern() uses Object.create(null), producing objects without
+// Object.prototype. The RSC serializer rejects these. Spreading ({...obj})
+// restores a normal prototype. Object.assign onto the Promise preserves
+// synchronous property access (params.id, params.slug) that existing
+// components and test fixtures rely on.
+function makeThenableParams(obj) {
+  const plain = { ...obj };
+  return Object.assign(Promise.resolve(plain), plain);
+}
+
 // djb2 hash — matches Next.js's stringHash for digest generation.
 // Produces a stable numeric string from error message + stack.
 function __errorDigest(str) {
@@ -296,6 +311,48 @@ function rscOnError(error) {
   if (error && typeof error === "object" && "digest" in error) {
     return String(error.digest);
   }
+
+  // In dev, detect the "Only plain objects" RSC serialization error and emit
+  // an actionable hint. This error occurs when a Server Component passes a
+  // class instance, ES module namespace object, or null-prototype object as a
+  // prop to a Client Component.
+  //
+  // Root cause: Vite bundles modules as true ESM (module namespace objects
+  // have a null-like internal slot), while Next.js's webpack build produces
+  // plain CJS-wrapped objects with __esModule:true. React's RSC serializer
+  // accepts the latter as plain objects but rejects the former — which means
+  // code that accidentally passes "import * as X" works in webpack/Next.js
+  // but correctly fails in vinext.
+  //
+  // Common triggers:
+  //   - "import * as utils from './utils'" passed as a prop
+  //   - class instances (new Foo()) passed as props
+  //   - Date / Map / Set instances passed as props
+  //   - Objects with Object.create(null) (null prototype)
+  if (
+    process.env.NODE_ENV !== "production" &&
+    error instanceof Error &&
+    error.message.includes("Only plain objects, and a few built-ins, can be passed to Client Components")
+  ) {
+    console.error(
+      "[vinext] RSC serialization error: a non-plain object was passed from a Server Component to a Client Component.\\n" +
+      "\\n" +
+      "Common causes:\\n" +
+      "  * Passing a module namespace (import * as X) directly as a prop.\\n" +
+      "    Unlike Next.js (webpack), Vite produces real ESM module namespace objects\\n" +
+      "    which are not serializable. Fix: pass individual values instead,\\n" +
+      "    e.g. <Comp value={module.value} />\\n" +
+      "  * Passing a class instance (new Foo()) as a prop.\\n" +
+      "    Fix: convert to a plain object, e.g. { id: foo.id, name: foo.name }\\n" +
+      "  * Passing a Date, Map, or Set. Use .toISOString(), [...map.entries()], etc.\\n" +
+      "  * Passing Object.create(null). Use { ...obj } to restore a prototype.\\n" +
+      "\\n" +
+      "Original error:",
+      error.message,
+    );
+    return undefined;
+  }
+
   // In production, generate a digest hash for non-navigation errors
   if (process.env.NODE_ENV === "production" && error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -636,8 +693,8 @@ async function buildPageElement(route, params, opts, searchParams) {
   // Build nested layout tree from outermost to innermost.
   // Next.js 16 passes params/searchParams as Promises (async pattern)
   // but pre-16 code accesses them as plain objects (params.id).
-  // We create a "thenable object" that works both ways.
-  const asyncParams = Object.assign(Promise.resolve(params), params);
+  // makeThenableParams() normalises null-prototype + preserves both patterns.
+  const asyncParams = makeThenableParams(params);
   const pageProps = { params: asyncParams };
   if (searchParams) {
     const spObj = {};
@@ -660,7 +717,7 @@ async function buildPageElement(route, params, opts, searchParams) {
     // approximation: pages with query params in the URL are almost always
     // dynamic, and this avoids false positives from React internals.
     if (hasSearchParams) markDynamicUsage();
-    pageProps.searchParams = Object.assign(Promise.resolve(spObj), spObj);
+    pageProps.searchParams = makeThenableParams(spObj);
   }
   let element = createElement(PageComponent, pageProps);
 
@@ -761,7 +818,7 @@ async function buildPageElement(route, params, opts, searchParams) {
         }
       }
 
-      const layoutProps = { children: element, params: Object.assign(Promise.resolve(params), params) };
+      const layoutProps = { children: element, params: makeThenableParams(params) };
 
       // Add parallel slot elements to the layout that defines them.
       // Each slot has a layoutIndex indicating which layout it belongs to.
@@ -783,7 +840,7 @@ async function buildPageElement(route, params, opts, searchParams) {
           }
 
           if (SlotPage) {
-            let slotElement = createElement(SlotPage, { params: Object.assign(Promise.resolve(slotParams), slotParams) });
+            let slotElement = createElement(SlotPage, { params: makeThenableParams(slotParams) });
             // Wrap with slot-specific layout if present.
             // In Next.js, @slot/layout.tsx wraps the slot's page content
             // before it is passed as a prop to the parent layout.
@@ -791,7 +848,7 @@ async function buildPageElement(route, params, opts, searchParams) {
             if (SlotLayout) {
               slotElement = createElement(SlotLayout, {
                 children: slotElement,
-                params: Object.assign(Promise.resolve(slotParams), slotParams),
+                params: makeThenableParams(slotParams),
               });
             }
             // Wrap with slot-specific loading if present
@@ -915,7 +972,7 @@ ${generateNormalizePathCode("modern")}
 
 // ── Config pattern matching (redirects, rewrites, headers) ──────────────
 function __matchConfigPattern(pathname, pattern) {
-  if (pattern.includes("(") || pattern.includes("\\\\") || /:[\\w-]+[*+][^/]/.test(pattern)) {
+  if (pattern.includes("(") || pattern.includes("\\\\") || /:[\\w-]+[*+][^/]/.test(pattern) || /:[\\w-]+\\./.test(pattern)) {
     try {
       const paramNames = [];
       const regexStr = pattern
@@ -1152,7 +1209,7 @@ async function __proxyExternalRequest(request, externalUrl) {
   return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: respHeaders });
 }
 
-function __applyConfigHeaders(pathname) {
+function __applyConfigHeaders(pathname, ctx) {
   const result = [];
   for (const rule of __configHeaders) {
     const groups = [];
@@ -1168,7 +1225,12 @@ function __applyConfigHeaders(pathname) {
       .replace(/:[\\w-]+/g, "[^/]+")
       .replace(/___GROUP_(\\d+)___/g, (_, idx) => "(" + groups[Number(idx)] + ")");
     const sourceRegex = __safeRegExp("^" + escaped + "$");
-    if (sourceRegex && sourceRegex.test(pathname)) result.push(...rule.headers);
+    if (sourceRegex && sourceRegex.test(pathname)) {
+      if (ctx && (rule.has || rule.missing)) {
+        if (!__checkHasConditions(rule.has, rule.missing, ctx)) continue;
+      }
+      result.push(...rule.headers);
+    }
   }
   return result;
 }
@@ -1185,7 +1247,8 @@ export default async function handler(request) {
       _runWithCacheState(() =>
         _runWithPrivateCache(() =>
           runWithFetchCache(async () => {
-            const response = await _handleRequest(request);
+            const __reqCtx = __buildRequestContext(request);
+            const response = await _handleRequest(request, __reqCtx);
             // Apply custom headers from next.config.js to non-redirect responses.
             // Skip redirects (3xx) because Response.redirect() creates immutable headers,
             // and Next.js doesn't apply custom headers to redirects anyway.
@@ -1194,7 +1257,7 @@ export default async function handler(request) {
               let pathname;
               try { pathname = __normalizePath(decodeURIComponent(url.pathname)); } catch { pathname = url.pathname; }
               ${bp ? `if (pathname.startsWith(${JSON.stringify(bp)})) pathname = pathname.slice(${JSON.stringify(bp)}.length) || "/";` : ""}
-              const extraHeaders = __applyConfigHeaders(pathname);
+              const extraHeaders = __applyConfigHeaders(pathname, __reqCtx);
               for (const h of extraHeaders) {
                 response.headers.set(h.key, h.value);
               }
@@ -1207,7 +1270,7 @@ export default async function handler(request) {
   );
 }
 
-async function _handleRequest(request) {
+async function _handleRequest(request, __reqCtx) {
   const url = new URL(request.url);
 
   // ── Cross-origin request protection ─────────────────────────────────
@@ -1253,7 +1316,6 @@ async function _handleRequest(request) {
   }
 
   // ── Apply redirects from next.config.js ───────────────────────────────
-  const __reqCtx = __buildRequestContext(request);
   if (__configRedirects.length) {
     const __redir = __applyConfigRedirects(pathname, __reqCtx);
     if (__redir) {
@@ -1291,10 +1353,20 @@ async function _handleRequest(request) {
   let _middlewareRewriteStatus = null;
 
   ${middlewarePath ? `
-     // Run proxy/middleware if present and path matches
-  const middlewareFn = middlewareModule.default || middlewareModule.proxy || middlewareModule.middleware;
+   // Run proxy/middleware if present and path matches.
+   // Validate exports match the file type (proxy.ts vs middleware.ts), matching Next.js behavior.
+   // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/proxy-missing-export/proxy-missing-export.test.ts
+  const _isProxy = ${JSON.stringify(isProxyFile(middlewarePath))};
+  const middlewareFn = _isProxy
+    ? (middlewareModule.proxy ?? middlewareModule.default)
+    : (middlewareModule.middleware ?? middlewareModule.default);
+  if (typeof middlewareFn !== "function") {
+    const _fileType = _isProxy ? "Proxy" : "Middleware";
+    const _expectedExport = _isProxy ? "proxy" : "middleware";
+    throw new Error("The " + _fileType + " file must export a function named \`" + _expectedExport + "\` or a \`default\` function.");
+  }
   const middlewareMatcher = middlewareModule.config?.matcher;
-  if (typeof middlewareFn === "function" && matchesMiddleware(cleanPathname, middlewareMatcher)) {
+  if (matchesMiddleware(cleanPathname, middlewareMatcher)) {
     try {
       // Wrap in NextRequest so middleware gets .nextUrl, .cookies, .geo, .ip, etc.
        // Always construct a new Request with the fully decoded + normalized pathname
@@ -1950,7 +2022,7 @@ async function _handleRequest(request) {
   // triggers renderHTTPAccessFallbackPage with ALL route layouts, but one of those
   // layouts itself throws notFound() during the fallback rendering (causing a 500).
   if (route.layouts && route.layouts.length > 0) {
-    const asyncParams = Object.assign(Promise.resolve(params), params);
+    const asyncParams = makeThenableParams(params);
     for (let li = route.layouts.length - 1; li >= 0; li--) {
       const LayoutComp = route.layouts[li]?.default;
       if (!LayoutComp) continue;
@@ -2220,9 +2292,10 @@ export function generateSsrEntry(): string {
   return `
 import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
 import { renderToReadableStream, renderToStaticMarkup } from "react-dom/server.edge";
-import { setNavigationContext } from "next/navigation";
+import { setNavigationContext, ServerInsertedHTMLContext } from "next/navigation";
 import { runWithNavigationContext as _runWithNavCtx } from "vinext/navigation-state";
 import { safeJsonStringify } from "vinext/html";
+import { createElement as _ssrCE } from "react";
 
 /**
  * Collect all chunks from a ReadableStream into an array of text strings.
@@ -2243,6 +2316,20 @@ async function collectStreamChunks(stream) {
   }
   return chunks;
 }
+
+// React 19 dev-mode workaround (see VinextFlightRoot in handleSsr):
+//
+// In dev, Flight error decoding in react-server-dom-webpack/client.edge
+// can hit resolveErrorDev() which (via React's dev error stack capture)
+// expects a non-null hooks dispatcher.
+//
+// Vinext previously called createFromReadableStream() outside of any React render.
+// When an RSC stream contains an error, dev-mode decoding could crash with:
+//   - "Invalid hook call"
+//   - "Cannot read properties of null (reading 'useContext')"
+//
+// Fix: call createFromReadableStream() lazily inside a React component render.
+// This mirrors Next.js behavior and ensures the dispatcher is set.
 
 /**
  * Create a TransformStream that appends RSC chunks as inline <script> tags
@@ -2358,7 +2445,7 @@ export async function handleSsr(rscStream, navContext, fontData) {
   }
 
   // Clear any stale callbacks from previous requests
-  const { clearServerInsertedHTML, flushServerInsertedHTML } = await import("next/navigation");
+  const { clearServerInsertedHTML, flushServerInsertedHTML, useServerInsertedHTML: _addInsertedHTML } = await import("next/navigation");
   clearServerInsertedHTML();
 
   try {
@@ -2378,7 +2465,27 @@ export async function handleSsr(rscStream, navContext, fontData) {
     // immediately in the HTML shell, then stream in resolved content as RSC
     // chunks arrive. Awaiting here would block until all async server components
     // complete, collapsing the streaming behavior.
-    const root = createFromReadableStream(ssrStream);
+    // Lazily create the Flight root inside render so React's hook dispatcher is set
+    // (avoids React 19 dev-mode resolveErrorDev() crash). VinextFlightRoot returns
+    // a thenable (not a ReactNode), which React 19 consumes via its internal
+    // thenable-as-child suspend/resume behavior. This matches Next.js's approach.
+    let flightRoot;
+    function VinextFlightRoot() {
+      if (!flightRoot) {
+        flightRoot = createFromReadableStream(ssrStream);
+      }
+      return flightRoot;
+    }
+    const root = _ssrCE(VinextFlightRoot);
+
+    // Wrap with ServerInsertedHTMLContext.Provider so libraries that use
+    // useContext(ServerInsertedHTMLContext) (Apollo Client, styled-components,
+    // etc.) get a working callback registration function during SSR.
+    // The provider value is useServerInsertedHTML — same function that direct
+    // callers use — so both paths push to the same ALS-backed callback array.
+    const ssrRoot = ServerInsertedHTMLContext
+      ? _ssrCE(ServerInsertedHTMLContext.Provider, { value: _addInsertedHTML }, root)
+      : root;
 
     // Get the bootstrap script content for the browser entry
     const bootstrapScriptContent =
@@ -2403,7 +2510,7 @@ export async function handleSsr(rscStream, navContext, fontData) {
     // client-side error boundaries from identifying the error type.
     // In production, non-navigation errors also get a digest hash so they
     // can be correlated with server logs without leaking details to clients.
-    const htmlStream = await renderToReadableStream(root, {
+    const htmlStream = await renderToReadableStream(ssrRoot, {
       bootstrapScriptContent,
       onError(error) {
         if (error && typeof error === "object" && "digest" in error) {
@@ -2424,11 +2531,11 @@ export async function handleSsr(rscStream, navContext, fontData) {
     const insertedElements = flushServerInsertedHTML();
 
     // Render the inserted elements to HTML strings
-    const { createElement, Fragment } = await import("react");
+    const { Fragment } = await import("react");
     let insertedHTML = "";
     for (const el of insertedElements) {
       try {
-        insertedHTML += renderToStaticMarkup(createElement(Fragment, null, el));
+        insertedHTML += renderToStaticMarkup(_ssrCE(Fragment, null, el));
       } catch {
         // Skip elements that can't be rendered
       }
@@ -2595,6 +2702,24 @@ export async function handleSsr(rscStream, navContext, fontData) {
   }
   }); // end _runWithNavCtx
 }
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("//")) {
+      return new Response("404 Not Found", { status: 404 });
+    }
+    const rscModule = await import.meta.viteRsc.loadModule("rsc", "index");
+    const result = await rscModule.default(request);
+    if (result instanceof Response) {
+      return result;
+    }
+    if (result === null || result === undefined) {
+      return new Response("Not Found", { status: 404 });
+    }
+    return new Response(String(result), { status: 200 });
+  },
+};
 `;
 }
 
